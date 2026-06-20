@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ title }}</title>
+    <style>
+      :root {
+        --bg: #f6f1e8;
+        --paper: #fffaf0;
+        --ink: #222;
+        --accent: #c06132;
+        --muted: #77695c;
+      }
+
+      body {
+        margin: 0;
+        font-family: Georgia, "Times New Roman", serif;
+        background: radial-gradient(circle at top, #fff8eb, var(--bg));
+        color: var(--ink);
+      }
+
+      main {
+        max-width: 960px;
+        margin: 0 auto;
+        padding: 32px 20px 72px;
+      }
+
+      h1 {
+        margin: 0 0 8px;
+        font-size: clamp(2rem, 3vw, 3.5rem);
+      }
+
+      form, .panel {
+        background: var(--paper);
+        border: 1px solid #eadbc8;
+        border-radius: 16px;
+        padding: 20px;
+        box-shadow: 0 12px 30px rgba(85, 55, 20, 0.08);
+      }
+
+      form {
+        display: grid;
+        gap: 12px;
+      }
+
+      button {
+        width: fit-content;
+        padding: 10px 16px;
+        border: 0;
+        border-radius: 999px;
+        background: var(--accent);
+        color: white;
+        cursor: pointer;
+      }
+
+      button.secondary {
+        background: #d7c6b0;
+        color: var(--ink);
+      }
+
+      #reader {
+        margin-top: 20px;
+        display: grid;
+        gap: 16px;
+      }
+
+      [hidden] {
+        display: none !important;
+      }
+
+      .word {
+        cursor: pointer;
+        margin-right: 0.25rem;
+      }
+
+      .word.active {
+        background: #f8d8a6;
+        border-radius: 4px;
+      }
+
+      .stack {
+        display: grid;
+        gap: 16px;
+        margin-top: 24px;
+      }
+
+      #status {
+        color: var(--muted);
+      }
+
+      .status-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .chapter-row {
+        display: grid;
+        gap: 8px;
+        padding: 12px 0;
+        border-top: 1px solid #eadbc8;
+      }
+
+      .chapter-row:first-child {
+        border-top: 0;
+        padding-top: 0;
+      }
+
+      .chapter-status-list {
+        display: grid;
+        gap: 10px;
+      }
+
+      .chapter-nav {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+
+      .chapter-nav button.active {
+        background: #8f4924;
+      }
+
+      .muted {
+        color: var(--muted);
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>{{ title }}</h1>
+      <p>TikTok destroys your brain. Bookamine destroys it slower.</p>
+      <p>Import one ebook and chapter audio, match chapters once, then read completed chapters with word-level sync.</p>
+
+      <form id="upload-form">
+        <label>
+          Ebook
+          <input type="file" name="ebook" accept=".txt,.epub" required />
+        </label>
+        <label>
+          Audiobook Chapters
+          <input type="file" id="audio-files" name="audio_files" accept=".mp3,.m4b" multiple required />
+        </label>
+        <div class="muted">Use one `.m4b` with embedded chapters or multiple `.mp3` files where each file is one chapter.</div>
+        <button type="submit">Create Chapter Session</button>
+      </form>
+
+      <div class="stack">
+        <div class="panel">
+          <div class="status-row">
+            <div id="status">Waiting for upload.</div>
+            <button type="button" id="clear-session" class="secondary">Clear Session</button>
+          </div>
+        </div>
+
+        <div class="panel" id="matching-panel" hidden>
+          <h2>Match Chapters</h2>
+          <form id="matching-form">
+            <div id="matching-list"></div>
+            <button type="submit">Start Processing</button>
+          </form>
+        </div>
+
+        <div class="panel" id="progress-panel" hidden>
+          <h2>Processing Progress</h2>
+          <div id="chapter-statuses" class="chapter-status-list"></div>
+        </div>
+
+        <div class="panel" id="reader-panel" hidden>
+          <h2>Reader</h2>
+          <div id="chapter-nav" class="chapter-nav"></div>
+          <audio id="audio" controls></audio>
+          <div id="chapter-title" class="muted"></div>
+          <div id="reader"></div>
+        </div>
+      </div>
+    </main>
+
+    <script type="module" src="/static/reader.js"></script>
+  </body>
+</html>

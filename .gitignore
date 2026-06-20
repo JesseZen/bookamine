@@ -1,0 +1,13 @@
+__pycache__/
+.pytest_cache/
+data/
+.hyperspec-state.yaml
+
+# doc / spec / planning artifacts
+.codex/
+docs/
+superpowers/
+openspec/
+
+# claude session artifacts
+.claude/
