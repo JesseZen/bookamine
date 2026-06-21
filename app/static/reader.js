@@ -1,11 +1,19 @@
 import { buildBlockSegments } from "./reader_render.mjs";
 
-const form = document.querySelector("#upload-form");
+const ebookFileInput = document.querySelector("#ebook-file");
+const audioFileInput = document.querySelector("#audio-files");
+const uploadEbookSection = document.querySelector("#upload-ebook-section");
+const uploadAudioSection = document.querySelector("#upload-audio-section");
+const ebookResult = document.querySelector("#ebook-result");
+const audioResult = document.querySelector("#audio-result");
+const audioProgress = document.querySelector("#audio-progress");
 const status = document.querySelector("#status");
 const clearSessionButton = document.querySelector("#clear-session");
-const matchingPanel = document.querySelector("#matching-panel");
-const matchingForm = document.querySelector("#matching-form");
-const matchingList = document.querySelector("#matching-list");
+const chapterGridPanel = document.querySelector("#chapter-grid-panel");
+const chapterGrid = document.querySelector("#chapter-grid");
+const processAllBtn = document.querySelector("#process-all-btn");
+const batchStatus = document.querySelector("#batch-status");
+const multicoreCheckbox = document.querySelector("#use-multicore");
 const progressPanel = document.querySelector("#progress-panel");
 const chapterStatuses = document.querySelector("#chapter-statuses");
 const readerPanel = document.querySelector("#reader-panel");
@@ -26,15 +34,138 @@ const state = {
 const searchParams = new URLSearchParams(window.location.search);
 const initialSessionId = searchParams.get("session_id");
 
-form?.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const body = new FormData(form);
-  status.textContent = "Uploading files...";
-  const response = await fetch("/chapter-sessions", { method: "POST", body });
+ebookFileInput?.addEventListener("change", async () => {
+  const file = ebookFileInput.files[0];
+  if (!file) {
+    return;
+  }
+  ebookResult.textContent = "Parsing ebook...";
+  const body = new FormData();
+  body.append("ebook", file);
+  const response = await fetch("/sessions/ebook", { method: "POST", body });
   const payload = await response.json();
+  if (!response.ok) {
+    ebookResult.textContent = payload.detail;
+    return;
+  }
+  state.sessionId = payload.session_id;
   window.history.replaceState(null, "", `/?session_id=${payload.session_id}`);
-  await loadSession(payload.session_id);
+  uploadEbookSection.classList.add("done");
+  ebookResult.textContent = `✓ Detected ${payload.ebook_chapters.length} ebook chapters`;
+  uploadAudioSection.hidden = false;
+  audioFileInput.focus();
 });
+
+audioFileInput?.addEventListener("change", () => {
+  const files = audioFileInput.files;
+  if (!files || files.length === 0 || !state.sessionId) {
+    return;
+  }
+  if (files.length === 1) {
+    uploadViaWebSocket(files[0]);
+  } else {
+    uploadViaHttp(files);
+  }
+});
+
+function uploadViaWebSocket(file) {
+  audioFileInput.disabled = true;
+  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  const wsUrl = `${protocol}//${location.host}/ws/sessions/${state.sessionId}/audio-upload`;
+  const ws = new WebSocket(wsUrl);
+  ws.onopen = async () => {
+    ws.send(JSON.stringify({ filename: file.name }));
+    const chunkSize = 256 * 1024;
+    let offset = 0;
+    while (offset < file.size) {
+      const end = Math.min(offset + chunkSize, file.size);
+      const buffer = await file.slice(offset, end).arrayBuffer();
+      ws.send(buffer);
+      offset = end;
+    }
+    ws.send(new TextEncoder().encode("__EOF__"));
+  };
+  ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    if (msg.type === "progress") {
+      audioProgress.hidden = false;
+      audioProgress.value = msg.received;
+      audioProgress.max = file.size;
+      const pct = Math.round((msg.received / file.size) * 100);
+      if (pct >= 100) {
+        audioResult.textContent = "File received, finalizing on server...";
+      } else {
+        audioResult.textContent = `Uploading... ${pct}%`;
+      }
+    } else if (msg.type === "chapters_early") {
+      audioResult.textContent = `✓ Detected ${msg.chapters.length} audio chapters early! (upload continues...)`;
+    } else if (msg.type === "done") {
+      audioProgress.hidden = true;
+      uploadAudioSection.classList.add("done");
+      audioResult.textContent = `✓ Detected ${msg.payload.audio_chapters.length} audio chapters`;
+      audioFileInput.disabled = false;
+      loadSessionFromPayload(msg.payload);
+    } else if (msg.type === "error") {
+      audioFileInput.disabled = false;
+      audioResult.textContent = msg.detail;
+    }
+  };
+  ws.onerror = () => {
+    audioResult.textContent = "WebSocket unavailable, trying HTTP upload...";
+    audioFileInput.disabled = false;
+    uploadViaHttp(audioFileInput.files);
+  };
+  audioResult.textContent = "Connecting for streaming upload...";
+  audioProgress.hidden = false;
+  audioProgress.value = 0;
+}
+
+function uploadViaHttp(files) {
+  const body = new FormData();
+  for (const file of files) {
+    body.append("audio_files", file);
+  }
+  audioFileInput.disabled = true;
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", `/sessions/${state.sessionId}/audio`);
+  xhr.upload.addEventListener("progress", (event) => {
+    if (event.lengthComputable) {
+      audioProgress.hidden = false;
+      audioProgress.value = event.loaded;
+      audioProgress.max = event.total;
+      const pct = Math.round((event.loaded / event.total) * 100);
+      if (pct >= 100) {
+        audioResult.textContent = "Upload received, detecting chapters on server...";
+      } else {
+        audioResult.textContent = `Uploading... ${pct}%`;
+      }
+    }
+  });
+  xhr.addEventListener("load", () => {
+    audioFileInput.disabled = false;
+    if (xhr.status >= 200 && xhr.status < 300) {
+      const payload = JSON.parse(xhr.responseText);
+      audioProgress.hidden = true;
+      uploadAudioSection.classList.add("done");
+      audioResult.textContent = `✓ Detected ${payload.audio_chapters.length} audio chapters`;
+      loadSessionFromPayload(payload);
+    } else {
+      let detail = "Upload failed.";
+      try {
+        detail = JSON.parse(xhr.responseText).detail || detail;
+      } catch (_) { /* ignore */ }
+      audioResult.textContent = detail;
+    }
+  });
+  xhr.addEventListener("error", () => {
+    audioFileInput.disabled = false;
+    audioResult.textContent = "Upload failed.";
+  });
+  audioResult.textContent = "Uploading audiobook...";
+  audioProgress.hidden = false;
+  audioProgress.value = 0;
+  xhr.send(body);
+}
 
 if (initialSessionId) {
   status.textContent = "Loading existing session...";
@@ -42,7 +173,7 @@ if (initialSessionId) {
 }
 
 clearSessionButton?.addEventListener("click", () => {
-  resetSessionState();
+  resetSessionState("Select an ebook file to begin.");
 });
 
 audio?.addEventListener("timeupdate", () => {
@@ -60,27 +191,83 @@ reader?.addEventListener("click", (event) => {
   setActiveWord(Number(target.dataset.wordIndex));
 });
 
-matchingForm?.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  if (!state.sessionId || !state.session) {
+processAllBtn?.addEventListener("click", async () => {
+  if (!state.sessionId) {
     return;
   }
-  const matches = state.session.ebook_chapters.map((chapter) => ({
-    ebook_chapter_index: chapter.index,
-    audio_chapter_index: readAudioChapterSelection(chapter.index),
-  }));
-  status.textContent = "Saving chapter mapping...";
-  const response = await fetch(`/chapter-sessions/${state.sessionId}/mapping`, {
+  processAllBtn.disabled = true;
+  const multicore = multicoreCheckbox?.checked ?? false;
+  batchStatus.textContent = "Initializing...";
+  const initResp = await fetch(`/sessions/${state.sessionId}/init-process`, { method: "POST" });
+  const initPayload = await initResp.json();
+  if (!initResp.ok) {
+    batchStatus.textContent = initPayload.detail;
+    processAllBtn.disabled = false;
+    return;
+  }
+  const pending = initPayload.chapter_statuses.filter((s) => s.status === "pending");
+  if (pending.length === 0) {
+    batchStatus.textContent = "No chapters to process.";
+    processAllBtn.disabled = false;
+    return;
+  }
+  if (multicore) {
+    for (const s of pending) {
+      fetch(`/sessions/${state.sessionId}/process-chapter`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ebook_chapter_index: s.ebook_chapter_index,
+          audio_chapter_index: s.audio_chapter_index,
+        }),
+      });
+    }
+  } else {
+    processRemainingSequential(initPayload);
+  }
+  await loadSession(state.sessionId);
+});
+
+async function processRemainingSequential(initPayload) {
+  const pending = initPayload.chapter_statuses.filter((s) => s.status === "pending");
+  for (const s of pending) {
+    batchStatus.textContent = `Processing ${s.title}...`;
+    await fetch(`/sessions/${state.sessionId}/process-chapter`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ebook_chapter_index: s.ebook_chapter_index,
+        audio_chapter_index: s.audio_chapter_index,
+      }),
+    });
+    await loadSession(state.sessionId);
+  }
+  batchStatus.textContent = "All chapters processed.";
+  processAllBtn.disabled = false;
+}
+
+chapterGrid?.addEventListener("click", async (event) => {
+  const processBtn = event.target.closest("[data-action='process-chapter']");
+  if (!processBtn || !state.sessionId) {
+    return;
+  }
+  processBtn.disabled = true;
+  const ebookIdx = Number(processBtn.dataset.ebookIndex);
+  const select = chapterGrid.querySelector(`[data-ebook-index="${ebookIdx}"]`);
+  const audioIdx = select ? Number(select.value) : null;
+  if (audioIdx === null || isNaN(audioIdx)) {
+    processBtn.disabled = false;
+    return;
+  }
+  await fetch(`/sessions/${state.sessionId}/process-chapter`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ matches }),
+    body: JSON.stringify({
+      ebook_chapter_index: ebookIdx,
+      audio_chapter_index: audioIdx,
+    }),
   });
-  const payload = await response.json();
-  if (!response.ok) {
-    status.textContent = payload.detail;
-    return;
-  }
-  await loadSession(payload.session_id);
+  await loadSession(state.sessionId);
 });
 
 async function loadSession(sessionId) {
@@ -95,6 +282,10 @@ async function loadSession(sessionId) {
     return;
   }
   state.session = payload;
+  loadSessionFromPayload(payload);
+}
+
+function loadSessionFromPayload(payload) {
   renderSession(payload);
   schedulePoll(payload);
 }
@@ -109,7 +300,7 @@ function schedulePoll(payload) {
   }
 }
 
-function resetSessionState(statusText = "Waiting for upload.") {
+function resetSessionState(statusText = "Select an ebook file to begin.") {
   if (state.pollTimer !== null) {
     window.clearTimeout(state.pollTimer);
     state.pollTimer = null;
@@ -119,15 +310,25 @@ function resetSessionState(statusText = "Waiting for upload.") {
   state.sessionId = null;
   state.session = null;
   state.words = [];
-  form?.reset();
-  matchingList.innerHTML = "";
+  ebookFileInput.value = "";
+  audioFileInput.value = "";
+  audioFileInput.disabled = false;
+  uploadEbookSection.classList.remove("done");
+  uploadAudioSection.classList.add("done");
+  uploadAudioSection.hidden = true;
+  ebookResult.textContent = "";
+  audioResult.textContent = "";
+  audioProgress.hidden = true;
+  chapterGrid.innerHTML = "";
   chapterStatuses.innerHTML = "";
   chapterNav.innerHTML = "";
   chapterTitle.textContent = "";
   reader.innerHTML = "";
-  matchingPanel.hidden = true;
+  chapterGridPanel.hidden = true;
   progressPanel.hidden = true;
   readerPanel.hidden = true;
+  processAllBtn.disabled = false;
+  batchStatus.textContent = "";
   audio.pause();
   audio.removeAttribute("src");
   audio.load();
@@ -136,15 +337,19 @@ function resetSessionState(statusText = "Waiting for upload.") {
 }
 
 function renderSession(payload) {
-  renderMatchingPanel(payload);
+  renderChapterGrid(payload);
   renderProgressPanel(payload);
   renderReaderPanel(payload);
+  if (payload.status === "awaiting_audio") {
+    status.textContent = "Ebook parsed. Select an audiobook file.";
+    return;
+  }
   if (payload.status === "matching") {
-    status.textContent = "Match each ebook chapter to one audio chapter, or skip chapters with no matching audio.";
+    status.textContent = "Adjust chapter matches below, then process individually or all at once.";
     return;
   }
   if (payload.status === "processing") {
-    const readableCount = payload.chapter_statuses.filter((chapter) =>
+    const readableCount = (payload.chapter_statuses || []).filter((chapter) =>
       ["ready", "transcript-only"].includes(chapter.status)
     ).length;
     status.textContent = `Processing chapters... ${readableCount}/${payload.chapter_statuses.length} readable.`;
@@ -161,47 +366,64 @@ function renderSession(payload) {
   status.textContent = `Ready. ${payload.completed_chapters?.length ?? 0} chapters available.`;
 }
 
-function renderMatchingPanel(payload) {
-  const isMatching = payload.status === "matching";
-  matchingPanel.hidden = !isMatching;
-  if (!isMatching) {
+function renderChapterGrid(payload) {
+  const showGrid =
+    payload.status === "matching" || payload.status === "processing" ||
+    payload.status === "ready" || payload.status === "failed-partial";
+  chapterGridPanel.hidden = !showGrid;
+  if (!showGrid) {
     return;
   }
-  matchingList.innerHTML = "";
-  for (const ebookChapter of payload.ebook_chapters) {
+  const chapterStatusesMap = new Map(
+    (payload.chapter_statuses || []).map((s) => [s.ebook_chapter_index, s])
+  );
+  chapterGrid.innerHTML = "";
+  for (const ebookChapter of payload.ebook_chapters || []) {
     const row = document.createElement("div");
     row.className = "chapter-row";
-    const label = document.createElement("label");
+    const label = document.createElement("div");
     label.textContent = ebookChapter.title;
+    label.style.fontWeight = "600";
+    const controls = document.createElement("div");
+    controls.className = "chapter-controls";
     const select = document.createElement("select");
     select.dataset.ebookIndex = String(ebookChapter.index);
     const skipOption = document.createElement("option");
     skipOption.value = "";
     skipOption.textContent = "Skip";
-    if (ebookChapter.suggested_audio_chapter_index === null) {
-      skipOption.selected = true;
-    }
     select.append(skipOption);
-    for (const audioChapter of payload.audio_chapters) {
+    for (const audioChapter of payload.audio_chapters || []) {
       const option = document.createElement("option");
       option.value = String(audioChapter.index);
       option.textContent = audioChapter.title;
-      if (audioChapter.index === ebookChapter.suggested_audio_chapter_index) {
-        option.selected = true;
-      }
       select.append(option);
     }
-    row.append(label, select);
-    matchingList.append(row);
+    const chapterStatus = chapterStatusesMap.get(ebookChapter.index);
+    if (chapterStatus) {
+      select.value =
+        chapterStatus.audio_chapter_index !== null && chapterStatus.audio_chapter_index !== undefined
+          ? String(chapterStatus.audio_chapter_index)
+          : "";
+      select.disabled = true;
+      const badge = document.createElement("span");
+      badge.className = `chapter-status-badge ${chapterStatus.status}`;
+      badge.textContent = chapterStatus.status;
+      controls.append(select, badge);
+    } else {
+      if (ebookChapter.suggested_audio_chapter_index !== null) {
+        select.value = String(ebookChapter.suggested_audio_chapter_index);
+      }
+      const processBtn = document.createElement("button");
+      processBtn.type = "button";
+      processBtn.className = "small";
+      processBtn.dataset.action = "process-chapter";
+      processBtn.dataset.ebookIndex = String(ebookChapter.index);
+      processBtn.textContent = "Process";
+      controls.append(select, processBtn);
+    }
+    row.append(label, controls);
+    chapterGrid.append(row);
   }
-}
-
-function readAudioChapterSelection(ebookChapterIndex) {
-  const value = matchingForm.querySelector(`[data-ebook-index="${ebookChapterIndex}"]`)?.value ?? "";
-  if (value === "") {
-    return null;
-  }
-  return Number(value);
 }
 
 function renderProgressPanel(payload) {
@@ -211,6 +433,9 @@ function renderProgressPanel(payload) {
   for (const chapterStatus of chapterStateList) {
     const row = document.createElement("div");
     row.className = "chapter-row";
+    row.style.animation = "none";
+    row.style.opacity = "1";
+    row.style.transform = "none";
     row.textContent = `${chapterStatus.title}: ${chapterStatus.status}`;
     if (chapterStatus.reason) {
       const reason = document.createElement("div");

@@ -1,6 +1,9 @@
 import json
+import os
 import re
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Protocol
 
@@ -231,6 +234,7 @@ class SessionService:
         self.data_dir = data_dir
         self.sessions_dir = data_dir / "sessions"
         self.transcriber = transcriber
+        self._lock = threading.Lock()
 
     def create_session(
         self,
@@ -334,9 +338,191 @@ class SessionService:
                 encoding="utf-8",
             )
 
-    def process_chapter_session(self, session_id: str) -> None:
+    def process_chapter_session(self, session_id: str, parallel: bool = False) -> None:
+        if parallel:
+            self._process_chapter_session_parallel(session_id)
+            return
         while self.process_next_pending_chapter(session_id):
             continue
+
+    def create_session_from_ebook(self, ebook_name: str, ebook_content: bytes) -> dict:
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        if Path(ebook_name).suffix.lower() not in {".txt", ".epub"}:
+            raise ValueError(f"Unsupported ebook format: {ebook_name}")
+        session_id = f"session-{len(list(self.sessions_dir.iterdir())) + 1}"
+        session_dir = self.sessions_dir / session_id
+        session_dir.mkdir()
+        parsed_book = parse_ebook_bytes(ebook_content, ebook_name)
+        (session_dir / ebook_name).write_bytes(ebook_content)
+        (session_dir / "book.json").write_text(
+            json.dumps(parsed_book.to_dict(), indent=2),
+            encoding="utf-8",
+        )
+        ebook_chapters = [
+            {
+                "title": chapter.title,
+                "index": chapter.index,
+                "block_indexes": chapter.block_indexes,
+                "word_indexes": chapter.word_indexes,
+            }
+            for chapter in parsed_book.chapters
+        ]
+        payload = {
+            "session_id": session_id,
+            "status": "awaiting_audio",
+            "ebook_chapters": ebook_chapters,
+            "audio_chapters": None,
+        }
+        (session_dir / "session.json").write_text(
+            json.dumps(payload, indent=2),
+            encoding="utf-8",
+        )
+        return payload
+
+    def finalize_audio_upload(self, session_id: str, audio_names: list[str]) -> dict:
+        session_dir = self.sessions_dir / session_id
+        if not session_dir.exists():
+            raise SessionNotFoundError(f"Session not found: {session_id}")
+        audio_chapters = self._build_audio_chapters_from_names(session_dir, audio_names)
+        (session_dir / "audio_chapters.json").write_text(
+            json.dumps([chapter.__dict__ for chapter in audio_chapters], indent=2),
+            encoding="utf-8",
+        )
+        book = ParsedBook.from_dict(
+            json.loads((session_dir / "book.json").read_text(encoding="utf-8"))
+        )
+        ebook_chapters = self._build_ebook_chapters(book, audio_chapters)
+        payload = self.read_session(session_id)
+        payload["status"] = "matching"
+        payload["ebook_chapters"] = ebook_chapters
+        payload["audio_chapters"] = [chapter.__dict__ for chapter in audio_chapters]
+        self._write_session_locked(session_dir, payload)
+        return payload
+
+    def _build_audio_chapters_from_names(self, session_dir: Path, audio_names: list[str]) -> list[AudioChapter]:
+        if Path(audio_names[0]).suffix.lower() == ".m4b":
+            source_name = audio_names[0]
+            chapters = discover_m4b_chapters(session_dir / source_name)
+            return [
+                AudioChapter(
+                    index=index,
+                    title=chapter["title"],
+                    source_name=source_name,
+                    start_ms=chapter["start_ms"],
+                    end_ms=chapter["end_ms"],
+                )
+                for index, chapter in enumerate(chapters)
+            ]
+        ordered_names = sorted(audio_names)
+        return [
+            AudioChapter(index=index, title=Path(name).stem, source_name=name)
+            for index, name in enumerate(ordered_names)
+        ]
+
+    def add_audio_to_session(self, session_id: str, audio_files: list[tuple[str, bytes]]) -> dict:
+        session_dir = self.sessions_dir / session_id
+        if not session_dir.exists():
+            raise SessionNotFoundError(f"Session not found: {session_id}")
+        audio_names = [name for name, _ in audio_files]
+        suffixes = {Path(name).suffix.lower() for name in audio_names}
+        if not (suffixes == {".mp3"} or (suffixes == {".m4b"} and len(audio_names) == 1)):
+            raise ValueError("Chapter sessions accept either one .m4b or multiple .mp3 files")
+        for audio_name, audio_content in audio_files:
+            (session_dir / audio_name).write_bytes(audio_content)
+        audio_chapters = self._build_audio_chapters(session_dir, audio_files)
+        (session_dir / "audio_chapters.json").write_text(
+            json.dumps([chapter.__dict__ for chapter in audio_chapters], indent=2),
+            encoding="utf-8",
+        )
+        book = ParsedBook.from_dict(
+            json.loads((session_dir / "book.json").read_text(encoding="utf-8"))
+        )
+        ebook_chapters = self._build_ebook_chapters(book, audio_chapters)
+        payload = self.read_session(session_id)
+        payload["status"] = "matching"
+        payload["ebook_chapters"] = ebook_chapters
+        payload["audio_chapters"] = [chapter.__dict__ for chapter in audio_chapters]
+        self._write_session_locked(session_dir, payload)
+        return payload
+
+    def init_chapter_statuses(self, session_id: str) -> dict:
+        session_dir = self.sessions_dir / session_id
+        payload = self.read_session(session_id)
+        if payload.get("chapter_statuses"):
+            return payload
+        book = ParsedBook.from_dict(
+            json.loads((session_dir / "book.json").read_text(encoding="utf-8"))
+        )
+        audio_chapters = json.loads(
+            (session_dir / "audio_chapters.json").read_text(encoding="utf-8")
+        )
+        chapter_statuses = []
+        for ebook_chapter in payload.get("ebook_chapters", []):
+            audio_idx = ebook_chapter.get("suggested_audio_chapter_index")
+            chapter_statuses.append(
+                {
+                    "ebook_chapter_index": ebook_chapter["index"],
+                    "audio_chapter_index": audio_idx,
+                    "status": "pending" if audio_idx is not None else "skipped",
+                    "title": book.chapters[ebook_chapter["index"]].title,
+                }
+            )
+        payload["chapter_statuses"] = chapter_statuses
+        payload["chapter_mappings"] = [
+            {
+                "ebook_chapter_index": ebook_chapter["index"],
+                "audio_chapter_index": ebook_chapter.get("suggested_audio_chapter_index"),
+            }
+            for ebook_chapter in payload.get("ebook_chapters", [])
+        ]
+        (session_dir / "chapter_mappings.json").write_text(
+            json.dumps(payload["chapter_mappings"], indent=2),
+            encoding="utf-8",
+        )
+        payload["status"] = "processing"
+        self._write_session_locked(session_dir, payload)
+        return payload
+
+    def process_single_chapter(self, session_id: str, ebook_chapter_index: int, audio_chapter_index: int) -> None:
+        if self.transcriber is None:
+            return
+        session_dir = self.sessions_dir / session_id
+        payload = self.read_session(session_id)
+        book = ParsedBook.from_dict(
+            json.loads((session_dir / "book.json").read_text(encoding="utf-8"))
+        )
+        audio_chapters = json.loads(
+            (session_dir / "audio_chapters.json").read_text(encoding="utf-8")
+        )
+        pending_status = {
+            "ebook_chapter_index": ebook_chapter_index,
+            "audio_chapter_index": audio_chapter_index,
+            "status": "processing",
+            "title": book.chapters[ebook_chapter_index].title,
+        }
+        chapter_statuses = payload.setdefault("chapter_statuses", [])
+        existing = next(
+            (s for s in chapter_statuses if s["ebook_chapter_index"] == ebook_chapter_index),
+            None,
+        )
+        if existing:
+            existing.update(pending_status)
+        else:
+            chapter_statuses.append(pending_status)
+        payload["status"] = self._derive_chapter_session_status(payload)
+        self._write_session_locked(session_dir, payload)
+        try:
+            result = self._transcribe_and_align(session_dir, session_id, pending_status, book, audio_chapters)
+            pending_status["status"] = result["status"]
+            if "reason" in result:
+                pending_status["reason"] = result["reason"]
+            payload.setdefault("completed_chapters", []).append(result["completed_chapter"])
+        except Exception as error:
+            pending_status["status"] = "failed"
+            pending_status["reason"] = str(error)
+        payload.setdefault("completed_chapters", []).sort(key=lambda chapter: chapter["chapter_index"])
+        payload["status"] = self._derive_chapter_session_status(payload)
+        self._write_session_locked(session_dir, payload)
 
     def read_session(self, session_id: str) -> dict:
         session_path = self.sessions_dir / session_id / "session.json"
@@ -417,69 +603,132 @@ class SessionService:
             json.dumps(payload, indent=2),
             encoding="utf-8",
         )
+        book = ParsedBook.from_dict(
+            json.loads((session_dir / "book.json").read_text(encoding="utf-8"))
+        )
+        audio_chapters = json.loads(
+            (session_dir / "audio_chapters.json").read_text(encoding="utf-8")
+        )
         try:
-            book = ParsedBook.from_dict(
-                json.loads((session_dir / "book.json").read_text(encoding="utf-8"))
-            )
-            audio_chapters = json.loads(
-                (session_dir / "audio_chapters.json").read_text(encoding="utf-8")
-            )
-            ebook_chapter_index = pending_status["ebook_chapter_index"]
-            audio_chapter_index = pending_status["audio_chapter_index"]
-            book_chapter = book.chapters[ebook_chapter_index]
-            audio_chapter = next(
-                chapter for chapter in audio_chapters if chapter["index"] == audio_chapter_index
-            )
-            audio_path = self._resolve_audio_path_for_processing(session_dir, audio_chapter)
-            timed_words = self.transcriber.transcribe(audio_path)
-            chapter_word_indexes = set(book_chapter.word_indexes)
-            chapter_block_indexes = set(book_chapter.block_indexes)
-            chapter_words = [word for word in book.words if word.index in chapter_word_indexes]
-            chapter_blocks = [block for block in book.blocks if block.index in chapter_block_indexes]
-            completed_chapters = payload.setdefault("completed_chapters", [])
-            try:
-                alignment = align_words(chapter_words, timed_words)
-                pending_status["status"] = "ready"
-                completed_chapters.append(
-                    {
-                        "chapter_index": book_chapter.index,
-                        "title": book_chapter.title,
-                        "audio_url": f"/chapter-sessions/{session_id}/audio/{audio_path.name}",
-                        "blocks": [
-                            {
-                                "index": block.index,
-                                "text": block.text,
-                                "word_indexes": block.word_indexes,
-                            }
-                            for block in chapter_blocks
-                        ],
-                        "words": alignment.words,
-                        "coverage": alignment.coverage,
-                        "text_source": "ebook",
-                    }
-                )
-            except AlignmentFailure as error:
-                pending_status["status"] = "transcript-only"
-                pending_status["reason"] = str(error)
-                completed_chapters.append(
-                    self._build_transcript_chapter_payload(
-                        session_id=session_id,
-                        chapter_index=book_chapter.index,
-                        title=book_chapter.title,
-                        audio_name=audio_path.name,
-                        timed_words=timed_words,
-                    )
-                )
-            completed_chapters.sort(key=lambda chapter: chapter["chapter_index"])
+            result = self._transcribe_and_align(session_dir, session_id, pending_status, book, audio_chapters)
+            pending_status["status"] = result["status"]
+            if "reason" in result:
+                pending_status["reason"] = result["reason"]
+            payload.setdefault("completed_chapters", []).append(result["completed_chapter"])
         except Exception as error:
             pending_status["status"] = "failed"
             pending_status["reason"] = str(error)
+        payload.setdefault("completed_chapters", []).sort(key=lambda chapter: chapter["chapter_index"])
         payload["status"] = self._derive_chapter_session_status(payload)
         (session_dir / "session.json").write_text(
             json.dumps(payload, indent=2),
             encoding="utf-8",
         )
         return True
+
+    def _transcribe_and_align(
+        self,
+        session_dir: Path,
+        session_id: str,
+        pending_status: dict,
+        book: ParsedBook,
+        audio_chapters: list[dict],
+    ) -> dict:
+        book_chapter = book.chapters[pending_status["ebook_chapter_index"]]
+        audio_chapter = next(
+            chapter for chapter in audio_chapters if chapter["index"] == pending_status["audio_chapter_index"]
+        )
+        audio_path = self._resolve_audio_path_for_processing(session_dir, audio_chapter)
+        timed_words = self.transcriber.transcribe(audio_path)
+        chapter_word_indexes = set(book_chapter.word_indexes)
+        chapter_block_indexes = set(book_chapter.block_indexes)
+        chapter_words = [word for word in book.words if word.index in chapter_word_indexes]
+        chapter_blocks = [block for block in book.blocks if block.index in chapter_block_indexes]
+        try:
+            alignment = align_words(chapter_words, timed_words)
+            return {
+                "status": "ready",
+                "completed_chapter": {
+                    "chapter_index": book_chapter.index,
+                    "title": book_chapter.title,
+                    "audio_url": f"/chapter-sessions/{session_id}/audio/{audio_path.name}",
+                    "blocks": [
+                        {
+                            "index": block.index,
+                            "text": block.text,
+                            "word_indexes": block.word_indexes,
+                        }
+                        for block in chapter_blocks
+                    ],
+                    "words": alignment.words,
+                    "coverage": alignment.coverage,
+                    "text_source": "ebook",
+                },
+            }
+        except AlignmentFailure as error:
+            return {
+                "status": "transcript-only",
+                "reason": str(error),
+                "completed_chapter": self._build_transcript_chapter_payload(
+                    session_id=session_id,
+                    chapter_index=book_chapter.index,
+                    title=book_chapter.title,
+                    audio_name=audio_path.name,
+                    timed_words=timed_words,
+                ),
+            }
+
+    def _process_chapter_session_parallel(self, session_id: str) -> None:
+        session_dir = self.sessions_dir / session_id
+        payload = self.read_session(session_id)
+        pending_list = [s for s in payload.get("chapter_statuses", []) if s["status"] == "pending"]
+        if not pending_list:
+            return
+        for pending_status in pending_list:
+            pending_status["status"] = "processing"
+        self._write_session_locked(session_dir, payload)
+        book = ParsedBook.from_dict(
+            json.loads((session_dir / "book.json").read_text(encoding="utf-8"))
+        )
+        audio_chapters = json.loads(
+            (session_dir / "audio_chapters.json").read_text(encoding="utf-8")
+        )
+        max_workers = min(len(pending_list), os.cpu_count() or 1)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {}
+            for pending_status in pending_list:
+                future = executor.submit(
+                    self._transcribe_and_align,
+                    session_dir,
+                    session_id,
+                    pending_status,
+                    book,
+                    audio_chapters,
+                )
+                futures[future] = pending_status
+            for future in as_completed(futures):
+                pending_status = futures[future]
+                try:
+                    result = future.result()
+                    pending_status["status"] = result["status"]
+                    if "reason" in result:
+                        pending_status["reason"] = result["reason"]
+                    payload.setdefault("completed_chapters", []).append(result["completed_chapter"])
+                except Exception as error:
+                    pending_status["status"] = "failed"
+                    pending_status["reason"] = str(error)
+                payload.setdefault("completed_chapters", []).sort(
+                    key=lambda chapter: chapter["chapter_index"]
+                )
+                payload["status"] = self._derive_chapter_session_status(payload)
+                self._write_session_locked(session_dir, payload)
+
+    def _write_session_locked(self, session_dir: Path, payload: dict) -> None:
+        with self._lock:
+            (session_dir / "session.json").write_text(
+                json.dumps(payload, indent=2),
+                encoding="utf-8",
+            )
 
     def get_audio_path(self, session_id: str) -> Path:
         return self._find_audio_path(self.sessions_dir / session_id)
