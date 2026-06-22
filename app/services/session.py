@@ -1,241 +1,89 @@
+"""Session orchestration: persistence, chapter processing, and status tracking."""
+
+from __future__ import annotations
+
 import json
+import logging
 import os
-import re
-import subprocess
 import threading
+import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Protocol
-
-from rapidfuzz import fuzz
 
 from app.alignment import AlignmentFailure, TimedWord, align_words
+from app.config import Settings
 from app.models import AudioChapter, ParsedBook, SessionSummary
 from app.parsers import parse_ebook_bytes
+from app.services.audio import (
+    SUPPORTED_AUDIO_SUFFIXES,
+    discover_m4b_chapters,
+    extract_m4b_chapter_clip,
+    find_audio_file,
+)
+from app.services.chapter_matching import suggest_audio_chapter_index
+from app.services.transcription import Transcriber
 
-SUPPORTED_AUDIO_SUFFIXES = {".mp3", ".m4b"}
-TITLE_TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
-ONES = {
-    "zero": 0,
-    "one": 1,
-    "first": 1,
-    "two": 2,
-    "second": 2,
-    "three": 3,
-    "third": 3,
-    "four": 4,
-    "fourth": 4,
-    "five": 5,
-    "fifth": 5,
-    "six": 6,
-    "sixth": 6,
-    "seven": 7,
-    "seventh": 7,
-    "eight": 8,
-    "eighth": 8,
-    "nine": 9,
-    "ninth": 9,
-}
-TEENS = {
-    "ten": 10,
-    "tenth": 10,
-    "eleven": 11,
-    "eleventh": 11,
-    "twelve": 12,
-    "twelfth": 12,
-    "thirteen": 13,
-    "thirteenth": 13,
-    "fourteen": 14,
-    "fourteenth": 14,
-    "fifteen": 15,
-    "fifteenth": 15,
-    "sixteen": 16,
-    "sixteenth": 16,
-    "seventeen": 17,
-    "seventeenth": 17,
-    "eighteen": 18,
-    "eighteenth": 18,
-    "nineteen": 19,
-    "nineteenth": 19,
-}
-TENS = {
-    "twenty": 20,
-    "twentieth": 20,
-    "thirty": 30,
-    "thirtieth": 30,
-    "forty": 40,
-    "fortieth": 40,
-    "fifty": 50,
-    "fiftieth": 50,
-    "sixty": 60,
-    "sixtieth": 60,
-    "seventy": 70,
-    "seventieth": 70,
-    "eighty": 80,
-    "eightieth": 80,
-    "ninety": 90,
-    "ninetieth": 90,
-}
-
-
-class Transcriber(Protocol):
-    def transcribe(self, audio_path: Path) -> list[TimedWord]: ...
+logger = logging.getLogger(__name__)
 
 
 class SessionNotFoundError(FileNotFoundError):
     pass
 
 
-class WhisperTranscriber:
-    def __init__(self, model_name: str = "base.en"):
-        self.model_name = model_name
-        self._model = None
-
-    def transcribe(self, audio_path: Path) -> list[TimedWord]:
-        if self._model is None:
-            import whisper
-
-            self._model = whisper.load_model(self.model_name)
-        result = self._model.transcribe(
-            str(audio_path),
-            language="en",
-            word_timestamps=True,
-            condition_on_previous_text=False,
-        )
-        timed_words: list[TimedWord] = []
-        for segment in result["segments"]:
-            for word in segment["words"]:
-                text = word["word"].strip()
-                if not text:
-                    continue
-                timed_words.append(
-                    TimedWord(
-                        text=text,
-                        normalized=text.casefold(),
-                        start_ms=round(word["start"] * 1000),
-                        end_ms=round(word["end"] * 1000),
-                    )
-                )
-        return timed_words
-
-
-def discover_m4b_chapters(audio_path: Path) -> list[dict]:
-    result = subprocess.run(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-print_format",
-            "json",
-            "-show_chapters",
-            str(audio_path),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    payload = json.loads(result.stdout or "{}")
-    chapters: list[dict] = []
-    for index, chapter in enumerate(payload.get("chapters", [])):
-        tags = chapter.get("tags", {})
-        chapters.append(
-            {
-                "index": index,
-                "title": tags.get("title") or f"Chapter {index + 1}",
-                "start_ms": round(float(chapter["start_time"]) * 1000),
-                "end_ms": round(float(chapter["end_time"]) * 1000),
-            }
-        )
-    return chapters
-
-
-def extract_chapter_number(title: str) -> int | None:
-    digit_match = re.search(r"\d+", title)
-    if digit_match is not None:
-        return int(digit_match.group(0))
-    raw_tokens = TITLE_TOKEN_PATTERN.findall(title.casefold().replace("-", " "))
-    tokens: list[str] = []
-    for token in raw_tokens:
-        expanded_tokens = expand_compound_number_token(token)
-        if expanded_tokens:
-            tokens.extend(expanded_tokens)
-            continue
-        tokens.append(token)
-    for index, token in enumerate(tokens):
-        if token in ONES:
-            return ONES[token]
-        if token in TEENS:
-            return TEENS[token]
-        if token in TENS:
-            if index + 1 < len(tokens) and tokens[index + 1] in ONES:
-                return TENS[token] + ONES[tokens[index + 1]]
-            return TENS[token]
-    return None
-
-
-def expand_compound_number_token(token: str) -> list[str]:
-    if token in ONES or token in TEENS or token in TENS:
-        return [token]
-    for tens_word in TENS:
-        if not token.startswith(tens_word) or token == tens_word:
-            continue
-        ones_word = token[len(tens_word) :]
-        if ones_word in ONES:
-            return [tens_word, ones_word]
-    return []
-
-
-def normalize_chapter_title(title: str) -> str:
-    tokens = TITLE_TOKEN_PATTERN.findall(title.casefold().replace("-", " "))
-    normalized_tokens: list[str] = []
-    chapter_number = extract_chapter_number(title)
-    if chapter_number is not None:
-        normalized_tokens.append(str(chapter_number))
-    for token in tokens:
-        if token.isdigit() or expand_compound_number_token(token):
-            continue
-        normalized_tokens.append(token)
-    return " ".join(normalized_tokens)
-
-
-def score_chapter_title_match(ebook_title: str, audio_title: str) -> float:
-    ebook_number = extract_chapter_number(ebook_title)
-    audio_number = extract_chapter_number(audio_title)
-    if ebook_number is not None and audio_number is not None:
-        return 1.0 if ebook_number == audio_number else 0.0
-    return fuzz.token_sort_ratio(
-        normalize_chapter_title(ebook_title),
-        normalize_chapter_title(audio_title),
-    ) / 100
-
-
-def suggest_audio_chapter_index(
-    ebook_title: str,
-    audio_chapters: list[AudioChapter],
-    used_audio_indexes: set[int],
-    threshold: float = 0.55,
-) -> int | None:
-    best_index: int | None = None
-    best_score = 0.0
-    for chapter in audio_chapters:
-        if chapter.index in used_audio_indexes:
-            continue
-        score = score_chapter_title_match(ebook_title, chapter.title)
-        if score > best_score:
-            best_score = score
-            best_index = chapter.index
-    if best_score < threshold:
-        return None
-    return best_index
+def _new_session_id() -> str:
+    return f"session-{uuid.uuid4().hex[:12]}"
 
 
 class SessionService:
-    def __init__(self, data_dir: Path, transcriber: Transcriber | None):
+    def __init__(
+        self,
+        data_dir: Path,
+        transcriber: Transcriber | None,
+        settings: Settings | None = None,
+    ):
         self.data_dir = data_dir
         self.sessions_dir = data_dir / "sessions"
         self.transcriber = transcriber
+        self.settings = settings
         self._lock = threading.Lock()
+        self._listeners: dict[str, list[callable]] = {}
 
+    @property
+    def _alignment_kwargs(self) -> dict:
+        if self.settings is None:
+            return {}
+        return {
+            "threshold": self.settings.alignment_threshold,
+            "window": self.settings.alignment_window,
+            "backtrack": self.settings.alignment_backtrack,
+            "match_score": self.settings.alignment_match_score,
+        }
+
+    # ------------------------------------------------------------------
+    # Event subscription for SSE / WebSocket progress streaming
+    # ------------------------------------------------------------------
+    def subscribe(self, session_id: str, callback: callable) -> callable:
+        self._listeners.setdefault(session_id, []).append(callback)
+
+        def unsubscribe() -> None:
+            try:
+                self._listeners[session_id].remove(callback)
+            except (KeyError, ValueError):
+                pass
+
+        return unsubscribe
+
+    def _notify(self, session_id: str) -> None:
+        for callback in self._listeners.get(session_id, []):
+            try:
+                callback(session_id)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Legacy single-audio session flow (kept for backwards compatibility)
+    # ------------------------------------------------------------------
     def create_session(
         self,
         ebook_name: str,
@@ -245,28 +93,24 @@ class SessionService:
     ) -> SessionSummary:
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         self._validate_upload_names(ebook_name, audio_name)
-        session_id = f"session-{len(list(self.sessions_dir.iterdir())) + 1}"
+        session_id = _new_session_id()
         session_dir = self.sessions_dir / session_id
         session_dir.mkdir()
         parsed_book = parse_ebook_bytes(ebook_content, ebook_name)
         (session_dir / ebook_name).write_bytes(ebook_content)
         (session_dir / audio_name).write_bytes(audio_content)
         (session_dir / "book.json").write_text(
-            json.dumps(parsed_book.to_dict(), indent=2),
-            encoding="utf-8",
+            json.dumps(parsed_book.to_dict(), indent=2), encoding="utf-8"
         )
-        (session_dir / "session.json").write_text(
-            json.dumps(
-                {
-                    "session_id": session_id,
-                    "status": "processing",
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
+        self._write_session_locked(session_dir, {
+            "session_id": session_id,
+            "status": "processing",
+        })
         return SessionSummary(session_id=session_id, status="processing")
 
+    # ------------------------------------------------------------------
+    # Chapter session flow
+    # ------------------------------------------------------------------
     def create_chapter_session(
         self,
         ebook_name: str,
@@ -275,7 +119,7 @@ class SessionService:
     ) -> SessionSummary:
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         self._validate_chapter_upload_names(ebook_name, [name for name, _ in audio_files])
-        session_id = f"session-{len(list(self.sessions_dir.iterdir())) + 1}"
+        session_id = _new_session_id()
         session_dir = self.sessions_dir / session_id
         session_dir.mkdir()
         parsed_book = parse_ebook_bytes(ebook_content, ebook_name)
@@ -285,78 +129,31 @@ class SessionService:
         audio_chapters = self._build_audio_chapters(session_dir, audio_files)
         ebook_chapters = self._build_ebook_chapters(parsed_book, audio_chapters)
         (session_dir / "book.json").write_text(
-            json.dumps(parsed_book.to_dict(), indent=2),
-            encoding="utf-8",
+            json.dumps(parsed_book.to_dict(), indent=2), encoding="utf-8"
         )
         (session_dir / "audio_chapters.json").write_text(
             json.dumps([chapter.__dict__ for chapter in audio_chapters], indent=2),
             encoding="utf-8",
         )
-        matching_payload = {
+        self._write_session_locked(session_dir, {
             "session_id": session_id,
             "status": "matching",
             "ebook_chapters": ebook_chapters,
             "audio_chapters": [chapter.__dict__ for chapter in audio_chapters],
-        }
-        (session_dir / "session.json").write_text(
-            json.dumps(matching_payload, indent=2),
-            encoding="utf-8",
-        )
+        })
         return SessionSummary(session_id=session_id, status="matching")
-
-    def process_session(self, session_id: str) -> None:
-        session_dir = self.sessions_dir / session_id
-        if self.transcriber is None:
-            return
-        try:
-            book = ParsedBook.from_dict(
-                json.loads((session_dir / "book.json").read_text(encoding="utf-8"))
-            )
-            audio_path = self._find_audio_path(session_dir)
-            timed_words = self.transcriber.transcribe(audio_path)
-            alignment = align_words(book.words, timed_words)
-            ready_payload = {
-                "session_id": session_id,
-                "status": "ready",
-                "audio_url": f"/sessions/{session_id}/audio",
-                "coverage": alignment.coverage,
-                "blocks": json.loads(json.dumps(book.to_dict()["blocks"])),
-                "words": alignment.words,
-            }
-            (session_dir / "session.json").write_text(
-                json.dumps(ready_payload, indent=2),
-                encoding="utf-8",
-            )
-        except Exception as error:
-            failed_payload = {
-                "session_id": session_id,
-                "status": "failed",
-                "reason": str(error),
-            }
-            (session_dir / "session.json").write_text(
-                json.dumps(failed_payload, indent=2),
-                encoding="utf-8",
-            )
-
-    def process_chapter_session(self, session_id: str, parallel: bool = False) -> None:
-        if parallel:
-            self._process_chapter_session_parallel(session_id)
-            return
-        while self.process_next_pending_chapter(session_id):
-            continue
 
     def create_session_from_ebook(self, ebook_name: str, ebook_content: bytes) -> dict:
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         if Path(ebook_name).suffix.lower() not in {".txt", ".epub"}:
             raise ValueError(f"Unsupported ebook format: {ebook_name}")
-        session_id = f"session-{len(list(self.sessions_dir.iterdir())) + 1}"
+        session_id = _new_session_id()
         session_dir = self.sessions_dir / session_id
         session_dir.mkdir()
         parsed_book = parse_ebook_bytes(ebook_content, ebook_name)
         (session_dir / ebook_name).write_bytes(ebook_content)
         (session_dir / "book.json").write_text(
-            json.dumps(parsed_book.to_dict(), indent=2),
-            encoding="utf-8",
+            json.dumps(parsed_book.to_dict(), indent=2), encoding="utf-8"
         )
         ebook_chapters = [
             {
@@ -373,10 +170,7 @@ class SessionService:
             "ebook_chapters": ebook_chapters,
             "audio_chapters": None,
         }
-        (session_dir / "session.json").write_text(
-            json.dumps(payload, indent=2),
-            encoding="utf-8",
-        )
+        self._write_session_locked(session_dir, payload)
         return payload
 
     def finalize_audio_upload(self, session_id: str, audio_names: list[str]) -> dict:
@@ -397,27 +191,8 @@ class SessionService:
         payload["ebook_chapters"] = ebook_chapters
         payload["audio_chapters"] = [chapter.__dict__ for chapter in audio_chapters]
         self._write_session_locked(session_dir, payload)
+        self._notify(session_id)
         return payload
-
-    def _build_audio_chapters_from_names(self, session_dir: Path, audio_names: list[str]) -> list[AudioChapter]:
-        if Path(audio_names[0]).suffix.lower() == ".m4b":
-            source_name = audio_names[0]
-            chapters = discover_m4b_chapters(session_dir / source_name)
-            return [
-                AudioChapter(
-                    index=index,
-                    title=chapter["title"],
-                    source_name=source_name,
-                    start_ms=chapter["start_ms"],
-                    end_ms=chapter["end_ms"],
-                )
-                for index, chapter in enumerate(chapters)
-            ]
-        ordered_names = sorted(audio_names)
-        return [
-            AudioChapter(index=index, title=Path(name).stem, source_name=name)
-            for index, name in enumerate(ordered_names)
-        ]
 
     def add_audio_to_session(self, session_id: str, audio_files: list[tuple[str, bytes]]) -> dict:
         session_dir = self.sessions_dir / session_id
@@ -443,6 +218,7 @@ class SessionService:
         payload["ebook_chapters"] = ebook_chapters
         payload["audio_chapters"] = [chapter.__dict__ for chapter in audio_chapters]
         self._write_session_locked(session_dir, payload)
+        self._notify(session_id)
         return payload
 
     def init_chapter_statuses(self, session_id: str) -> dict:
@@ -476,59 +252,165 @@ class SessionService:
             for ebook_chapter in payload.get("ebook_chapters", [])
         ]
         (session_dir / "chapter_mappings.json").write_text(
-            json.dumps(payload["chapter_mappings"], indent=2),
-            encoding="utf-8",
+            json.dumps(payload["chapter_mappings"], indent=2), encoding="utf-8"
         )
         payload["status"] = "processing"
         self._write_session_locked(session_dir, payload)
+        self._notify(session_id)
         return payload
 
     def process_single_chapter(self, session_id: str, ebook_chapter_index: int, audio_chapter_index: int) -> None:
         if self.transcriber is None:
             return
         session_dir = self.sessions_dir / session_id
-        payload = self.read_session(session_id)
-        book = ParsedBook.from_dict(
-            json.loads((session_dir / "book.json").read_text(encoding="utf-8"))
-        )
-        audio_chapters = json.loads(
-            (session_dir / "audio_chapters.json").read_text(encoding="utf-8")
-        )
-        pending_status = {
-            "ebook_chapter_index": ebook_chapter_index,
-            "audio_chapter_index": audio_chapter_index,
-            "status": "processing",
-            "title": book.chapters[ebook_chapter_index].title,
-        }
+        if not session_dir.exists():
+            return
+        try:
+            payload = self.read_session(session_id)
+            book = ParsedBook.from_dict(
+                json.loads((session_dir / "book.json").read_text(encoding="utf-8"))
+            )
+            audio_chapters = json.loads(
+                (session_dir / "audio_chapters.json").read_text(encoding="utf-8")
+            )
+        except (FileNotFoundError, SessionNotFoundError):
+            return
         chapter_statuses = payload.setdefault("chapter_statuses", [])
-        existing = next(
+        # Use a reference to the dict that's actually inside payload so
+        # mutations below are reflected when we write it back.
+        status_entry = next(
             (s for s in chapter_statuses if s["ebook_chapter_index"] == ebook_chapter_index),
             None,
         )
-        if existing:
-            existing.update(pending_status)
-        else:
-            chapter_statuses.append(pending_status)
+        if status_entry is None:
+            status_entry = {"ebook_chapter_index": ebook_chapter_index}
+            chapter_statuses.append(status_entry)
+        status_entry["audio_chapter_index"] = audio_chapter_index
+        status_entry["status"] = "processing"
+        status_entry["title"] = book.chapters[ebook_chapter_index].title
+        status_entry.pop("reason", None)
         payload["status"] = self._derive_chapter_session_status(payload)
         self._write_session_locked(session_dir, payload)
+        self._notify(session_id)
         try:
-            result = self._transcribe_and_align(session_dir, session_id, pending_status, book, audio_chapters)
-            pending_status["status"] = result["status"]
+            result = self._transcribe_and_align(session_dir, session_id, status_entry, book, audio_chapters)
+            status_entry["status"] = result["status"]
             if "reason" in result:
-                pending_status["reason"] = result["reason"]
-            payload.setdefault("completed_chapters", []).append(result["completed_chapter"])
+                status_entry["reason"] = result["reason"]
+            self._upsert_completed_chapter(payload, result["completed_chapter"])
+        except (FileNotFoundError, SessionNotFoundError):
+            return
         except Exception as error:
-            pending_status["status"] = "failed"
-            pending_status["reason"] = str(error)
+            status_entry["status"] = "failed"
+            status_entry["reason"] = str(error)
         payload.setdefault("completed_chapters", []).sort(key=lambda chapter: chapter["chapter_index"])
         payload["status"] = self._derive_chapter_session_status(payload)
         self._write_session_locked(session_dir, payload)
+        self._notify(session_id)
 
     def read_session(self, session_id: str) -> dict:
         session_path = self.sessions_dir / session_id / "session.json"
         if not session_path.exists():
             raise SessionNotFoundError(f"Session not found: {session_id}")
         return json.loads(session_path.read_text(encoding="utf-8"))
+
+    def list_sessions(self) -> list[dict]:
+        if not self.sessions_dir.exists():
+            return []
+        sessions = []
+        for entry in sorted(self.sessions_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+            if not entry.is_dir():
+                continue
+            session_path = entry / "session.json"
+            if not session_path.exists():
+                continue
+            try:
+                payload = json.loads(session_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                continue
+            ebook_chapters = payload.get("ebook_chapters") or []
+            chapter_statuses = payload.get("chapter_statuses") or []
+            completed = payload.get("completed_chapters") or []
+            sessions.append({
+                "session_id": payload.get("session_id", entry.name),
+                "status": payload.get("status", "unknown"),
+                "title": self._infer_session_title(entry),
+                "ebook_chapter_count": len(ebook_chapters),
+                "completed_chapter_count": len(completed),
+                "total_chapter_count": len(chapter_statuses) or len(ebook_chapters),
+                "created_at": entry.stat().st_mtime,
+            })
+        return sessions
+
+    def delete_session(self, session_id: str) -> None:
+        session_dir = self.sessions_dir / session_id
+        if not session_dir.exists():
+            raise SessionNotFoundError(f"Session not found: {session_id}")
+        import shutil
+        shutil.rmtree(session_dir)
+        self._listeners.pop(session_id, None)
+
+    def recover_stuck_sessions(self) -> int:
+        """Reset chapters stuck in 'processing' back to 'pending'.
+
+        Called on startup to recover from crashes where background tasks
+        died mid-processing. Returns the count of chapters reset.
+        """
+        if not self.sessions_dir.exists():
+            return 0
+        total_reset = 0
+        for entry in sorted(self.sessions_dir.iterdir()):
+            if not entry.is_dir():
+                continue
+            session_path = entry / "session.json"
+            if not session_path.exists():
+                continue
+            try:
+                payload = json.loads(session_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                continue
+            reset_count = 0
+            for status in payload.get("chapter_statuses", []):
+                if status.get("status") == "processing":
+                    status["status"] = "pending"
+                    status.pop("reason", None)
+                    reset_count += 1
+            if reset_count:
+                payload["status"] = self._derive_chapter_session_status(payload)
+                self._write_session_locked(entry, payload)
+                logger.info(
+                    "[%s] recovered %d stuck chapter(s)",
+                    payload.get("session_id", entry.name),
+                    reset_count,
+                )
+                total_reset += reset_count
+        return total_reset
+
+    def retry_chapter(self, session_id: str, ebook_chapter_index: int) -> dict:
+        session_dir = self.sessions_dir / session_id
+        payload = self.read_session(session_id)
+        chapter_statuses = payload.get("chapter_statuses", [])
+        status = next(
+            (s for s in chapter_statuses if s["ebook_chapter_index"] == ebook_chapter_index),
+            None,
+        )
+        if status is None:
+            raise ValueError(f"Chapter not found: {ebook_chapter_index}")
+        if status["status"] not in {"failed", "transcript-only", "processing"}:
+            raise ValueError(f"Chapter is not in a retryable state: {status['status']}")
+        audio_idx = status.get("audio_chapter_index")
+        if audio_idx is None:
+            raise ValueError("Skipped chapters cannot be retried")
+        status["status"] = "pending"
+        status.pop("reason", None)
+        completed = payload.get("completed_chapters", [])
+        payload["completed_chapters"] = [
+            c for c in completed if c["chapter_index"] != ebook_chapter_index
+        ]
+        payload["status"] = self._derive_chapter_session_status(payload)
+        self._write_session_locked(session_dir, payload)
+        self._notify(session_id)
+        return payload
 
     def get_chapter_audio_path(self, session_id: str, audio_name: str) -> Path:
         return self.sessions_dir / session_id / audio_name
@@ -578,20 +460,73 @@ class SessionService:
         }
         processing_payload["status"] = self._derive_chapter_session_status(processing_payload)
         (session_dir / "chapter_mappings.json").write_text(
-            json.dumps(sorted_matches, indent=2),
-            encoding="utf-8",
+            json.dumps(sorted_matches, indent=2), encoding="utf-8"
         )
-        (session_dir / "session.json").write_text(
-            json.dumps(processing_payload, indent=2),
-            encoding="utf-8",
-        )
+        self._write_session_locked(session_dir, processing_payload)
+        self._notify(session_id)
         return SessionSummary(session_id=session_id, status="processing")
+
+    def process_session(self, session_id: str) -> None:
+        session_dir = self.sessions_dir / session_id
+        if not session_dir.exists():
+            return
+        if self.transcriber is None:
+            return
+        logger.info("[%s] single-audio processing starting", session_id)
+        t_total = time.monotonic()
+        try:
+            book = ParsedBook.from_dict(
+                json.loads((session_dir / "book.json").read_text(encoding="utf-8"))
+            )
+            audio_path = find_audio_file(session_dir)
+            timed_words = self.transcriber.transcribe(audio_path)
+            alignment = align_words(book.words, timed_words, **self._alignment_kwargs)
+            logger.info(
+                "[%s] single-audio done in %.1fs (coverage %.0f%%)",
+                session_id,
+                time.monotonic() - t_total,
+                alignment.coverage * 100,
+            )
+            ready_payload = {
+                "session_id": session_id,
+                "status": "ready",
+                "audio_url": f"/sessions/{session_id}/audio",
+                "coverage": alignment.coverage,
+                "blocks": json.loads(json.dumps(book.to_dict()["blocks"])),
+                "words": alignment.words,
+            }
+            self._write_session_locked(session_dir, ready_payload)
+            self._notify(session_id)
+        except (FileNotFoundError, SessionNotFoundError):
+            # Session was deleted while the background task was running.
+            return
+        except Exception as error:
+            logger.exception("[%s] single-audio failed: %s", session_id, error)
+            failed_payload = {
+                "session_id": session_id,
+                "status": "failed",
+                "reason": str(error),
+            }
+            self._write_session_locked(session_dir, failed_payload)
+            self._notify(session_id)
+
+    def process_chapter_session(self, session_id: str, parallel: bool = False) -> None:
+        if parallel:
+            self._process_chapter_session_parallel(session_id)
+            return
+        while self.process_next_pending_chapter(session_id):
+            continue
 
     def process_next_pending_chapter(self, session_id: str) -> bool:
         if self.transcriber is None:
             return False
         session_dir = self.sessions_dir / session_id
-        payload = self.read_session(session_id)
+        if not session_dir.exists():
+            return False
+        try:
+            payload = self.read_session(session_id)
+        except SessionNotFoundError:
+            return False
         pending_status = next(
             (status for status in payload.get("chapter_statuses", []) if status["status"] == "pending"),
             None,
@@ -599,32 +534,57 @@ class SessionService:
         if pending_status is None:
             return False
         pending_status["status"] = "processing"
-        (session_dir / "session.json").write_text(
-            json.dumps(payload, indent=2),
-            encoding="utf-8",
-        )
-        book = ParsedBook.from_dict(
-            json.loads((session_dir / "book.json").read_text(encoding="utf-8"))
-        )
-        audio_chapters = json.loads(
-            (session_dir / "audio_chapters.json").read_text(encoding="utf-8")
-        )
+        self._write_session_locked(session_dir, payload)
+        self._notify(session_id)
         try:
+            book = ParsedBook.from_dict(
+                json.loads((session_dir / "book.json").read_text(encoding="utf-8"))
+            )
+            audio_chapters = json.loads(
+                (session_dir / "audio_chapters.json").read_text(encoding="utf-8")
+            )
             result = self._transcribe_and_align(session_dir, session_id, pending_status, book, audio_chapters)
             pending_status["status"] = result["status"]
             if "reason" in result:
                 pending_status["reason"] = result["reason"]
-            payload.setdefault("completed_chapters", []).append(result["completed_chapter"])
+            self._upsert_completed_chapter(payload, result["completed_chapter"])
+        except (FileNotFoundError, SessionNotFoundError):
+            # Session was deleted mid-processing.
+            return False
         except Exception as error:
+            logger.exception(
+                "[%s] chapter %d failed: %s",
+                session_id,
+                pending_status["ebook_chapter_index"] + 1,
+                error,
+            )
             pending_status["status"] = "failed"
             pending_status["reason"] = str(error)
         payload.setdefault("completed_chapters", []).sort(key=lambda chapter: chapter["chapter_index"])
         payload["status"] = self._derive_chapter_session_status(payload)
-        (session_dir / "session.json").write_text(
-            json.dumps(payload, indent=2),
-            encoding="utf-8",
-        )
+        self._write_session_locked(session_dir, payload)
+        self._notify(session_id)
         return True
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _upsert_completed_chapter(self, payload: dict, completed: dict) -> None:
+        chapters = payload.setdefault("completed_chapters", [])
+        for index, existing in enumerate(chapters):
+            if existing["chapter_index"] == completed["chapter_index"]:
+                chapters[index] = completed
+                return
+        chapters.append(completed)
+
+    def _infer_session_title(self, session_dir: Path) -> str:
+        book_path = session_dir / "book.json"
+        if book_path.exists():
+            try:
+                return json.loads(book_path.read_text(encoding="utf-8")).get("title", session_dir.name)
+            except json.JSONDecodeError:
+                pass
+        return session_dir.name
 
     def _transcribe_and_align(
         self,
@@ -639,13 +599,37 @@ class SessionService:
             chapter for chapter in audio_chapters if chapter["index"] == pending_status["audio_chapter_index"]
         )
         audio_path = self._resolve_audio_path_for_processing(session_dir, audio_chapter)
+        t_transcribe = time.monotonic()
+        logger.info(
+            "[%s] chapter %d/%d '%s': transcribing %s",
+            session_id,
+            pending_status["ebook_chapter_index"] + 1,
+            len(book.chapters),
+            book_chapter.title,
+            audio_path.name,
+        )
         timed_words = self.transcriber.transcribe(audio_path)
+        logger.info(
+            "[%s] chapter %d: transcribe done in %.1fs",
+            session_id,
+            pending_status["ebook_chapter_index"] + 1,
+            time.monotonic() - t_transcribe,
+        )
         chapter_word_indexes = set(book_chapter.word_indexes)
         chapter_block_indexes = set(book_chapter.block_indexes)
         chapter_words = [word for word in book.words if word.index in chapter_word_indexes]
         chapter_blocks = [block for block in book.blocks if block.index in chapter_block_indexes]
+        t_align = time.monotonic()
         try:
-            alignment = align_words(chapter_words, timed_words)
+            alignment = align_words(chapter_words, timed_words, **self._alignment_kwargs)
+            logger.info(
+                "[%s] chapter %d: aligned in %.1fs (coverage %.0f%%, %d words)",
+                session_id,
+                pending_status["ebook_chapter_index"] + 1,
+                time.monotonic() - t_align,
+                alignment.coverage * 100,
+                len(alignment.words),
+            )
             return {
                 "status": "ready",
                 "completed_chapter": {
@@ -666,6 +650,12 @@ class SessionService:
                 },
             }
         except AlignmentFailure as error:
+            logger.warning(
+                "[%s] chapter %d: alignment failed — %s",
+                session_id,
+                pending_status["ebook_chapter_index"] + 1,
+                error,
+            )
             return {
                 "status": "transcript-only",
                 "reason": str(error),
@@ -680,20 +670,36 @@ class SessionService:
 
     def _process_chapter_session_parallel(self, session_id: str) -> None:
         session_dir = self.sessions_dir / session_id
-        payload = self.read_session(session_id)
+        if not session_dir.exists():
+            return
+        try:
+            payload = self.read_session(session_id)
+            book = ParsedBook.from_dict(
+                json.loads((session_dir / "book.json").read_text(encoding="utf-8"))
+            )
+            audio_chapters = json.loads(
+                (session_dir / "audio_chapters.json").read_text(encoding="utf-8")
+            )
+        except (FileNotFoundError, SessionNotFoundError):
+            return
         pending_list = [s for s in payload.get("chapter_statuses", []) if s["status"] == "pending"]
         if not pending_list:
             return
         for pending_status in pending_list:
             pending_status["status"] = "processing"
         self._write_session_locked(session_dir, payload)
-        book = ParsedBook.from_dict(
-            json.loads((session_dir / "book.json").read_text(encoding="utf-8"))
+        self._notify(session_id)
+        cpu = os.cpu_count() or 1
+        configured = self.settings.max_workers if self.settings else None
+        max_workers = min(len(pending_list), configured or cpu)
+        logger.info(
+            "[%s] parallel processing %d chapters with %d workers",
+            session_id,
+            len(pending_list),
+            max_workers,
         )
-        audio_chapters = json.loads(
-            (session_dir / "audio_chapters.json").read_text(encoding="utf-8")
-        )
-        max_workers = min(len(pending_list), os.cpu_count() or 1)
+        t_batch = time.monotonic()
+        completed_count = 0
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {}
             for pending_status in pending_list:
@@ -707,23 +713,56 @@ class SessionService:
                 )
                 futures[future] = pending_status
             for future in as_completed(futures):
+                if not session_dir.exists():
+                    # Session deleted mid-processing; cancel remaining futures.
+                    for f in futures:
+                        f.cancel()
+                    logger.info("[%s] session deleted, cancelling remaining work", session_id)
+                    return
                 pending_status = futures[future]
                 try:
                     result = future.result()
                     pending_status["status"] = result["status"]
                     if "reason" in result:
                         pending_status["reason"] = result["reason"]
-                    payload.setdefault("completed_chapters", []).append(result["completed_chapter"])
+                    self._upsert_completed_chapter(payload, result["completed_chapter"])
+                    completed_count += 1
+                    logger.info(
+                        "[%s] %d/%d chapters completed (%.1fs elapsed)",
+                        session_id,
+                        completed_count,
+                        len(pending_list),
+                        time.monotonic() - t_batch,
+                    )
+                except (FileNotFoundError, SessionNotFoundError):
+                    return
                 except Exception as error:
                     pending_status["status"] = "failed"
                     pending_status["reason"] = str(error)
+                    logger.exception(
+                        "[%s] chapter %d failed: %s",
+                        session_id,
+                        pending_status["ebook_chapter_index"] + 1,
+                        error,
+                    )
                 payload.setdefault("completed_chapters", []).sort(
                     key=lambda chapter: chapter["chapter_index"]
                 )
                 payload["status"] = self._derive_chapter_session_status(payload)
                 self._write_session_locked(session_dir, payload)
+                self._notify(session_id)
+        logger.info(
+            "[%s] batch complete in %.1fs",
+            session_id,
+            time.monotonic() - t_batch,
+        )
 
     def _write_session_locked(self, session_dir: Path, payload: dict) -> None:
+        """Write session.json atomically. Silently no-ops if the session
+        directory was deleted while a background task was running."""
+        if not session_dir.exists():
+            # Session was deleted out from under a running background task.
+            return
         with self._lock:
             (session_dir / "session.json").write_text(
                 json.dumps(payload, indent=2),
@@ -731,7 +770,7 @@ class SessionService:
             )
 
     def get_audio_path(self, session_id: str) -> Path:
-        return self._find_audio_path(self.sessions_dir / session_id)
+        return find_audio_path(self.sessions_dir / session_id)
 
     def _validate_upload_names(self, ebook_name: str, audio_name: str) -> None:
         if Path(ebook_name).suffix.lower() not in {".txt", ".epub"}:
@@ -780,6 +819,26 @@ class SessionService:
             for index, name in enumerate(ordered_names)
         ]
 
+    def _build_audio_chapters_from_names(self, session_dir: Path, audio_names: list[str]) -> list[AudioChapter]:
+        if Path(audio_names[0]).suffix.lower() == ".m4b":
+            source_name = audio_names[0]
+            chapters = discover_m4b_chapters(session_dir / source_name)
+            return [
+                AudioChapter(
+                    index=index,
+                    title=chapter["title"],
+                    source_name=source_name,
+                    start_ms=chapter["start_ms"],
+                    end_ms=chapter["end_ms"],
+                )
+                for index, chapter in enumerate(chapters)
+            ]
+        ordered_names = sorted(audio_names)
+        return [
+            AudioChapter(index=index, title=Path(name).stem, source_name=name)
+            for index, name in enumerate(ordered_names)
+        ]
+
     def _build_ebook_chapters(
         self,
         parsed_book: ParsedBook,
@@ -806,12 +865,6 @@ class SessionService:
             )
         return ebook_chapters
 
-    def _find_audio_path(self, session_dir: Path) -> Path:
-        for file_path in session_dir.iterdir():
-            if file_path.suffix.lower() in SUPPORTED_AUDIO_SUFFIXES:
-                return file_path
-        raise FileNotFoundError(f"Audio file not found in {session_dir}")
-
     def _resolve_audio_path_for_processing(self, session_dir: Path, audio_chapter: dict) -> Path:
         audio_path = session_dir / audio_chapter["source_name"]
         if audio_path.suffix.lower() != ".m4b":
@@ -819,25 +872,7 @@ class SessionService:
         start_ms = audio_chapter["start_ms"]
         end_ms = audio_chapter["end_ms"]
         clip_path = session_dir / f"chapter-{audio_chapter['index'] + 1:03d}.mp3"
-        if clip_path.exists():
-            return clip_path
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-ss",
-                f"{start_ms / 1000:.3f}",
-                "-to",
-                f"{end_ms / 1000:.3f}",
-                "-i",
-                str(audio_path),
-                str(clip_path),
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        return clip_path
+        return extract_m4b_chapter_clip(audio_path, start_ms, end_ms, clip_path)
 
     def _build_transcript_chapter_payload(
         self,

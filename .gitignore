@@ -13,3 +13,8 @@ openspec/
 
 # claude session artifacts
 .claude/
+.trae/
+
+# backup files
+*.bak
+

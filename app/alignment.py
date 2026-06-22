@@ -1,3 +1,13 @@
+"""Word-level alignment between ebook text and transcribed timed words.
+
+The aligner walks the transcript in order, and for each timed word searches a
+small forward window of ebook words for the best fuzzy match. A short backtrack
+window lets the algorithm recover from transient mismatches (e.g. filler words
+the narrator added) without losing sync for the rest of the chapter.
+"""
+
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 from rapidfuzz import fuzz
@@ -28,6 +38,8 @@ def align_words(
     transcript_words: list[TimedWord],
     threshold: float = 0.6,
     window: int = 24,
+    backtrack: int = 4,
+    match_score: float = 0.85,
 ) -> AlignmentResult:
     aligned_words = [
         {
@@ -48,6 +60,8 @@ def align_words(
             normalized=timed_word.normalized,
             cursor=cursor,
             window=window,
+            backtrack=backtrack,
+            match_score=match_score,
         )
         if match_index is None:
             continue
@@ -68,15 +82,24 @@ def find_best_forward_match(
     normalized: str,
     cursor: int,
     window: int,
+    backtrack: int = 0,
+    match_score: float = 0.85,
 ) -> int | None:
+    """Find the best fuzzy match for ``normalized`` starting near ``cursor``.
+
+    A short backward window is also considered so that the aligner can recover
+    when the narrator inserted an extra word that produced no match. Already
+    aligned words are skipped so the same ebook word is never matched twice.
+    """
     best_index: int | None = None
-    best_score = 0.0
+    best_score = match_score
+    start = max(0, cursor - backtrack)
     limit = min(len(aligned_words), cursor + window)
-    for index in range(cursor, limit):
+    for index in range(start, limit):
+        if aligned_words[index]["start_ms"] is not None:
+            continue
         score = fuzz.ratio(aligned_words[index]["normalized"], normalized) / 100
         if score > best_score:
             best_score = score
             best_index = index
-    if best_score < 0.85:
-        return None
     return best_index

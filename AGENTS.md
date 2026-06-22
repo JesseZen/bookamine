@@ -1,12 +1,39 @@
-# AGENTS.md
-1. 坚持 KISS 原则，方案必须简单直接。
-2. 排查 bug 必须定位根本原因，修复源头，而不是随便打补丁。
-3. 禁写防御性或“兜底”代码，那样既不解决问题也增加调试成本。
-4. 修 bug 时要顺着我现在的设计逻辑来，别动不动就推翻或重写整体逻辑，先按现有实现思路去定位并解决。
-5. 代码保持平铺式：按执行顺序直接写在当前上下文，流程清晰、调用栈浅。
-6. 默认信任我构造的状态，必要检查提前放在固定位置，别到处加防御性判断或兜底逻辑。
-7. 避免大模块：单文件目标 <500 行（不含测试），超过 800 行必须拆新模块，拆分时把相关测试一起搬走。
-8. 测试用整体对象相等比较，不要逐字段断言。
-9. 不为静态值加测试，不为已删除逻辑加负面测试。
-10. 单次变更非机械改动不超过 800 行，复杂逻辑改动不超过 500 行，超出要拆成可审查阶段。
-11. 改动核心逻辑优先写集成测试，而非单元测试。
+# Repository Guidelines
+
+## Project Structure & Module Organization
+
+Bookamine is a FastAPI application packaged from `app/`. Core modules include `main.py` for app creation, `models.py` for shared data shapes, `parsers.py` for ebook parsing, and `alignment.py` for word alignment. Route handlers are in `app/routes/`, services are in `app/services/`, browser assets are in `app/static/`, and Jinja templates are in `app/templates/`.
+
+Tests live in `tests/`. Python tests use `test_*.py`; JavaScript module tests use `test_*.mjs`. Runtime uploads and generated session data belong under `data/`, which is ignored by git.
+
+## Build, Test, and Development Commands
+
+- `uv sync --extra dev --extra transcribe`: install Python dependencies, test tools, and optional local Whisper transcription support.
+- `uv run uvicorn app.main:app --reload`: run the development server at `http://127.0.0.1:8000`.
+- `uv run pytest -v`: run the Python test suite.
+- `node --test tests/*.mjs`: run JavaScript unit tests for browser helper modules.
+- `uv build`: build package artifacts with Hatchling.
+
+Install `ffmpeg` locally before testing real audio imports or running manual end-to-end flows.
+
+## Coding Style & Naming Conventions
+
+Use Python 3.14+ syntax and keep modules typed where practical. Follow the existing style: 4-space indentation, small functions, dataclasses for immutable value objects, and explicit names such as `FakeChapterTranscriber`. Prefer `snake_case` for Python functions, variables, and modules.
+
+For browser code, use ES modules in `app/static/*.mjs` when logic is testable outside the DOM. Keep DOM-heavy wiring in `reader.js`. Do not commit `.bak`, `__pycache__`, or generated `data/` contents.
+
+## Testing Guidelines
+
+Add Python tests beside related coverage in `tests/test_*.py` and use `tmp_path` for filesystem isolation. FastAPI endpoints should be exercised through `fastapi.testclient.TestClient`; transcription should use fake transcribers so tests stay deterministic and fast.
+
+Add JavaScript tests in `tests/test_*.mjs` with `node:test` and `node:assert/strict`. Cover parsing, alignment, session state, and reader helper behavior when changing those areas.
+
+## Commit & Pull Request Guidelines
+
+Recent commits use short conventional-style subjects such as `init: bookamine 1.0.0.dev1` and `merge(app): sync local workspace`. Keep subjects imperative and scoped when useful, for example `fix(alignment): handle repeated transcript words`.
+
+Pull requests should describe the behavior change, list test commands run, and note any manual verification for upload, matching, transcription, or reader playback flows. Include screenshots or short recordings for visible UI changes.
+
+## Security & Configuration Tips
+
+Treat uploaded books and audio as untrusted input. Keep secrets out of the repository, avoid committing runtime data from `data/`, and prefer dependency changes through `pyproject.toml` plus `uv.lock` updates.
